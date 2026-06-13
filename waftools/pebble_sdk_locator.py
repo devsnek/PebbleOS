@@ -16,7 +16,18 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from waflib import Logs
+try:
+    from waflib import Logs
+except ImportError:
+    # Allow reuse outside the waf runtime (e.g. the ./pbl dev CLI).
+    class Logs:
+        @staticmethod
+        def warn(msg, *args):
+            print(msg % args if args else msg)
+
+        @staticmethod
+        def pprint(color, msg):
+            print(msg)
 
 
 _VERSION_DIR_RE = re.compile(r"^pebbleos-sdk-(\d+)\.(\d+)\.(\d+)$")
@@ -66,12 +77,20 @@ def _find_sdk(repo_root):
         return None
 
     home = Path.home()
+    dev_pebble = home / "dev" / "pebble"
     opt = Path("/opt")
 
-    # Search order per spec: home versioned -> home unversioned -> opt versioned -> opt unversioned.
+    # Search order:
+    #   home versioned -> home unversioned -> dev versioned -> dev unversioned
+    #   -> opt versioned -> opt unversioned.
     for v, d in _versioned_candidates(home, min_ver):
         return (v, d)
     d = _unversioned_candidate(home)
+    if d is not None:
+        return (None, d)
+    for v, d in _versioned_candidates(dev_pebble, min_ver):
+        return (v, d)
+    d = _unversioned_candidate(dev_pebble)
     if d is not None:
         return (None, d)
     for v, d in _versioned_candidates(opt, min_ver):

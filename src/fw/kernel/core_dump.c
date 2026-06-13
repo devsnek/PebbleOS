@@ -107,13 +107,17 @@ static const MemoryRegion MEMORY_REGIONS_DUMP[] = {
 #if CONFIG_SOC_NRF52 || CONFIG_SOC_SF32LB52 || CONFIG_QEMU
   { .start = (void *)0x20000000, .length = COREDUMP_RAM_SIZE },
 #endif
-#if defined(CONFIG_SOC_SF32LB52)
-  { .start = (void *)COREDUMP_LCPU_RAM_START, .length = COREDUMP_LCPU_RAM_SIZE },
-#endif
   { .start = (void *)&NVIC->ISER, .length = sizeof(NVIC->ISER) },  // Enabled interrupts
   { .start = (void *)&NVIC->ISPR, .length = sizeof(NVIC->ISPR) },  // Pending interrupts
   { .start = (void *)&NVIC->IABR, .length = sizeof(NVIC->IABR) },  // Active interrupts
 };
+
+#if defined(CONFIG_SOC_SF32LB52)
+// LCPU RAM is dumped last and only when its domain is up; see prv_dump_lcpu_ram().
+static const MemoryRegion LCPU_MEMORY_REGION = {
+  .start = (void *)COREDUMP_LCPU_RAM_START, .length = COREDUMP_LCPU_RAM_SIZE,
+};
+#endif
 
 // -------------------------------------------------------------------------------------------------
 // Flash driver dual-API.
@@ -158,7 +162,7 @@ static void prv_debug_str(const char* msg) {
 // NOTE: We are explicitly avoiding use of vsniprintf and cohorts to reduce our stack
 // requirements
 static void prv_debug_str_str(const char* msg, const char* s) {
-#if PULSE_EVERYWHERE
+#ifdef CONFIG_PULSE_EVERYWHERE
   void *ctx = pulse_logging_log_sync_begin(LOG_LEVEL_ALWAYS, __FILE_NAME__, 0);
   pulse_logging_log_sync_append(ctx, msg);
   pulse_logging_log_sync_append(ctx, s);
@@ -188,7 +192,7 @@ static void prv_debug_str_int(const char* msg, uint32_t i, int base) {
     itoa(i, buffer, base);
   }
 
-#if PULSE_EVERYWHERE
+#ifdef CONFIG_PULSE_EVERYWHERE
   void *ctx = pulse_logging_log_sync_begin(LOG_LEVEL_ALWAYS, __FILE_NAME__, 0);
   pulse_logging_log_sync_append(ctx, msg);
   pulse_logging_log_sync_append(ctx, buffer);
@@ -442,6 +446,18 @@ static void prv_write_memory_regions(const MemoryRegion *regions, unsigned int c
   }
 }
 
+#if defined(CONFIG_SOC_SF32LB52)
+// Wake the LCPU so its LPSYS RAM is reachable, letting BLE crashes (e.g. NimBLE
+// host asserts) capture the controller RAM. HAL_HPAON_WakeCore busy-waits for
+// the LCPU to ack; if it is fully powered down this blocks until the watchdog
+// reboots us, costing only this dump. We reset right after, so the wake request
+// is never balanced.
+static void prv_dump_lcpu_ram(uint32_t flash_base) {
+  HAL_HPAON_WakeCore(CORE_ID_LCPU);
+  prv_write_memory_regions(&LCPU_MEMORY_REGION, 1, flash_base);
+}
+#endif
+
 // Write the Core Dump Image Header
 // Returns number of bytes written @ flash_addr
 static uint32_t prv_write_image_header(uint32_t flash_addr, uint8_t core_number,
@@ -658,6 +674,11 @@ EXTERNALLY_VISIBLE void core_dump_handler_c(void) {
     }
     prvTaskInfoCallback(&task_info, NULL);
   }
+
+#if defined(CONFIG_SOC_SF32LB52)
+  // Last: its read can hang/fault, so do it after the essential chunks are saved.
+  prv_dump_lcpu_ram(flash_base);
+#endif
 
   // Write out chunk terminator
   chunk_hdr.key = CORE_DUMP_CHUNK_KEY_TERMINATOR;

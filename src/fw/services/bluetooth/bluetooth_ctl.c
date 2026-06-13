@@ -67,26 +67,24 @@ static void prv_comm_start(void) {
   // Heap allocated to reduce stack usage
   BTDriverConfig *config = kernel_zalloc_check(sizeof(BTDriverConfig));
   dis_get_info(&config->dis_info);
-#if defined(CONFIG_HRM) && !defined(RECOVERY_FW)
+#if defined(CONFIG_HRM) && !defined(CONFIG_RECOVERY_FW)
   config->is_hrm_supported_and_enabled = ble_hrm_is_supported_and_enabled();
   PBL_LOG_INFO("BLE HRM sharing prefs: is_enabled=%u",
           config->is_hrm_supported_and_enabled);
 #endif
-#ifdef BT_REQUIRE_EARLY_BONDINGS
+  // Register existing bondings before bringing the connection up: NimBLE
+  // restores them before the link is established. The other backends use
+  // no-op bonding handlers, so doing it early is harmless for them too.
   bt_persistent_storage_register_existing_ble_bondings();
-#endif
 
   s_comm_is_running = bt_driver_start(config);
   kernel_free(config);
 
   if (s_comm_is_running) {
     bt_local_addr_init();
-#ifndef BT_REQUIRE_EARLY_BONDINGS
-    bt_persistent_storage_register_existing_ble_bondings();
-#endif
     gap_le_init();
     bt_local_id_configure_driver();
-#if defined(CONFIG_HRM) && !defined(RECOVERY_FW)
+#if defined(CONFIG_HRM) && !defined(CONFIG_RECOVERY_FW)
     ble_hrm_init();
 #endif
     ble_bas_init();
@@ -105,7 +103,7 @@ static void prv_comm_stop(void) {
   }
   stop_mode_disable(InhibitorCommMode);
   ble_bas_deinit();
-#if defined(CONFIG_HRM) && !defined(RECOVERY_FW)
+#if defined(CONFIG_HRM) && !defined(CONFIG_RECOVERY_FW)
   ble_hrm_deinit();
 #endif
   gap_le_deinit();

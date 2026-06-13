@@ -23,13 +23,12 @@
 
 #include "nimble_store.h"
 
-static const uint32_t s_bt_stack_start_stop_timeout_ms = 3000;
+PBL_LOG_MODULE_DEFINE(bt, CONFIG_BT_LOG_LEVEL);
+
+static const uint32_t s_bt_stack_start_stop_timeout_ms = 10000;
 
 extern void pebble_pairing_service_init(void);
 extern void nimble_discover_init(void);
-#ifdef BT_CONTROLLER_SF32LB52
-extern void ble_transport_ll_wake_lcpu(void);
-#endif
 
 #if NIMBLE_CFG_CONTROLLER
 static TaskHandle_t s_ll_task_handle;
@@ -47,30 +46,27 @@ typedef enum {
   DriverStateStopping,
 } DriverState;
 
-// Scheduling ble_hs_sched_start() while the vendor's ble_hs_enabled_state
-// is not OFF trips an assert in ble_hs_event_start_stage2. ble_hs_is_enabled()
-// only catches the ON case, so a leaked STOPPING (error-path ble_hs_stop
-// that times out before its completion callback fires) would slip past.
+// Host start/stop run to completion or crash on timeout, so this stays in sync
+// with the vendor's ble_hs_enabled_state (Stopped<->OFF, Started<->ON).
 static DriverState s_driver_state = DriverStateStopped;
 
 static void prv_sync_cb(void) {
-  PBL_LOG_D_DBG(LOG_DOMAIN_BT, "NimBLE host synchronized");
+  PBL_LOG_DBG("NimBLE host synchronized");
   xSemaphoreGive(s_host_started);
   bt_driver_handle_host_resynced();
 }
 
 static void prv_reset_cb(int reason) {
-  PBL_LOG_D_WRN(LOG_DOMAIN_BT, "NimBLE host reset (reason: 0x%04x)", (uint16_t)reason);
-#ifdef BT_CONTROLLER_SF32LB52
-  // Controller stopped answering HCI. Keep the LCPU reachable and crash so the
-  // coredump captures LCPU RAM; the reboot cold-recovers the controller.
-  ble_transport_ll_wake_lcpu();
+  PBL_LOG_WRN("NimBLE host reset (reason: 0x%04x)", (uint16_t)reason);
+#ifdef CONFIG_SOC_SF32LB52
+  // Controller stopped answering HCI. Crash so the coredump captures LCPU RAM
+  // (core_dump wakes the LCPU itself); the reboot cold-recovers the controller.
   PBL_CROAK("NimBLE host reset 0x%04x; captured LCPU RAM", (uint16_t)reason);
 #endif
 }
 
 static void prv_host_task_main(void *unused) {
-  PBL_LOG_D_DBG(LOG_DOMAIN_BT, "NimBLE host task started");
+  PBL_LOG_DBG("NimBLE host task started");
 
   ble_hs_cfg.sync_cb = prv_sync_cb;
   ble_hs_cfg.reset_cb = prv_reset_cb;
@@ -121,68 +117,20 @@ bool bt_driver_start(BTDriverConfig *config) {
   int rc;
   BaseType_t f_rc;
 
-  if (s_driver_state == DriverStateStopping) {
-    // A previous stop never completed from our perspective. Wait for
-    // the vendor's stop callback before scheduling a new start, since
-    // ble_hs_event_start_stage2 will assert if state isn't OFF.
-    f_rc = xSemaphoreTake(s_host_stopped, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
-    if (f_rc == pdTRUE) {
-      s_driver_state = DriverStateStopped;
-    } else {
-      // Probe vendor state: a NULL-listener ble_hs_stop is side-effect-free
-      // when vendor is OFF (returns BLE_HS_EALREADY) or STOPPING (no listener
-      // is registered, returns 0). It can only kick off a real stop from the
-      // ON state, which can't happen here -- we entered Stopping by calling
-      // ble_hs_stop ourselves, and the only vendor transition out is to OFF.
-      rc = ble_hs_stop(NULL, NULL, NULL);
-      if (rc == BLE_HS_EALREADY) {
-        PBL_LOG_D_WRN(LOG_DOMAIN_BT, "NimBLE host stop signal lost; vendor is OFF, proceeding");
-        s_driver_state = DriverStateStopped;
-      } else {
-        PBL_LOG_D_ERR(LOG_DOMAIN_BT, "NimBLE host stop never completed; refusing to start");
-        return false;
-      }
-    }
-  }
-
   if (s_driver_state == DriverStateStarted) {
-    PBL_LOG_D_WRN(LOG_DOMAIN_BT, "Driver already started; skipping start");
+    PBL_LOG_WRN("Driver already started; skipping start");
     return true;
   }
 
-  if (ble_hs_is_enabled()) {
-    // State mismatch: stop NimBLE so the fresh-start path re-runs
-    // ble_hs_util_ensure_addr.
-    PBL_LOG_D_WRN(LOG_DOMAIN_BT, "NimBLE host enabled but driver state is %u; resyncing",
-                  (unsigned)s_driver_state);
-    s_driver_state = DriverStateStopping;
-    (void)xSemaphoreTake(s_host_stopped, 0);
-    rc = ble_hs_stop(&s_listener, prv_ble_hs_stop_cb, NULL);
-    if (rc == BLE_HS_EALREADY) {
-      s_driver_state = DriverStateStopped;
-    } else if (rc != 0) {
-      PBL_LOG_D_ERR(LOG_DOMAIN_BT, "Failed to stop NimBLE host for resync: 0x%04x", (uint16_t)rc);
-      return false;
-    } else {
-      f_rc = xSemaphoreTake(s_host_stopped, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
-      if (f_rc != pdTRUE) {
-        // Leave state as STOPPING; the next start attempt will retry the wait.
-        PBL_LOG_D_ERR(LOG_DOMAIN_BT, "NimBLE host stop timed out during resync");
-        return false;
-      }
-      s_driver_state = DriverStateStopped;
-    }
-  }
-
   if (s_driver_state != DriverStateStopped) {
-    PBL_LOG_D_ERR(LOG_DOMAIN_BT, "Unexpected driver state %u; refusing to start",
+    PBL_LOG_ERR("Unexpected driver state %u; refusing to start",
                   (unsigned)s_driver_state);
     return false;
   }
 
   s_driver_state = DriverStateStarting;
-  // Drain a leftover host_started signal (e.g. sync_cb fired after a
-  // previous start timed out) so we wait for *this* start to sync.
+  // Drain a stale host_started signal (e.g. from an autonomous host re-sync)
+  // so we wait for *this* start to sync.
   (void)xSemaphoreTake(s_host_started, 0);
 
   s_dis_info = config->dis_info;
@@ -198,20 +146,20 @@ bool bt_driver_start(BTDriverConfig *config) {
   pebble_pairing_service_init();
   ble_svc_bas_init();
 
-#ifdef GH3X2X_TUNING_SERVICE_ENABLED
+#ifdef CONFIG_GH3X2X_TUNING_SERVICE_ENABLED
   gh3x2x_tuning_service_init();
 #endif
 
   ble_hs_sched_start();
   f_rc = xSemaphoreTake(s_host_started, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
   if (f_rc != pdTRUE) {
-    PBL_LOG_D_ERR(LOG_DOMAIN_BT, "Host synchronization timed out");
-    goto err;
+    // core_dump wakes the LCPU itself, so its RAM is captured here too.
+    PBL_CROAK("NimBLE host start timed out");
   }
 
   rc = ble_hs_util_ensure_addr(0);
   if (rc != 0) {
-    PBL_LOG_D_ERR(LOG_DOMAIN_BT, "Failed to ensure address: 0x%04x", (uint16_t)rc);
+    PBL_LOG_ERR("Failed to ensure address: 0x%04x", (uint16_t)rc);
     goto err;
   }
 
@@ -226,16 +174,12 @@ err:
     s_driver_state = DriverStateStopped;
     return false;
   } else if (rc != 0) {
-    PBL_LOG_D_ERR(LOG_DOMAIN_BT, "Failed to stop NimBLE host after start failure: 0x%04x", (uint16_t)rc);
+    PBL_LOG_ERR("Failed to stop NimBLE host after start failure: 0x%04x", (uint16_t)rc);
     return false;
   }
 
   f_rc = xSemaphoreTake(s_host_stopped, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
-  if (f_rc != pdTRUE) {
-    // Leave state as STOPPING; the next start attempt will retry the wait.
-    PBL_LOG_D_ERR(LOG_DOMAIN_BT, "NimBLE host stop timed out after start failure");
-    return false;
-  }
+  PBL_ASSERT(f_rc == pdTRUE, "NimBLE host stop timed out after start failure");
 
   s_driver_state = DriverStateStopped;
   (void)ble_gatts_reset();

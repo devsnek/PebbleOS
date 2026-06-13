@@ -16,6 +16,8 @@ import waftools.ldscript
 import waftools.objcopy
 import waftools.pblboot
 
+from tools.pebble_sdk_platform import pebble_platforms
+
 
 @feature("c")
 @before_method('apply_link')
@@ -73,13 +75,12 @@ def options(opt):
 
 def configure(conf):
     conf.load('binary_header')
-    conf.recurse('applib')
 
-    if conf.options.sdkshell:
-        conf.env.NORMAL_SHELL = 'sdk'
-        conf.env.append_value('DEFINES', ['SHELL_SDK'])
-    else:
-        conf.env.NORMAL_SHELL = 'normal'
+    platform = pebble_platforms[conf.env.PLATFORM_NAME]
+    define = 'MAX_FONT_GLYPH_SIZE={}'.format(platform['MAX_FONT_GLYPH_SIZE'])
+    conf.env.append_value('DEFINES', [define])
+
+    conf.env.NORMAL_SHELL = 'sdk' if conf.env.CONFIG_SHELL_SDK else 'normal'
 
     conf.env.PRF_AS_FIRMWARE = conf.options.prf_as_firmware
     if conf.options.prf_as_firmware:
@@ -113,7 +114,7 @@ def _generate_memory_layout(bld):
         slot_size = 3072 * 1024
         resources_size = 2048 * 1024
         prf_size = 576 * 1024
-        if bld.env.VARIANT == 'prf' and not (bld.env.IS_MFG or bld.env.PRF_AS_FIRMWARE):
+        if bld.env.VARIANT == 'prf' and not (bld.env.CONFIG_MFG or bld.env.PRF_AS_FIRMWARE):
             offset_size = ptable_size + bootloader_size + 2 * slot_size + 2 * resources_size
             fw_max_size = prf_size
         else:
@@ -127,7 +128,7 @@ def _generate_memory_layout(bld):
         # Bootloader
         offset_size = 32 * 1024
         flash_size = 1024 * 1024
-        if bld.env.CONFIG_BOARD_FAMILY_ASTERIX and bld.env.VARIANT == 'prf' and not bld.env.IS_MFG:
+        if bld.env.CONFIG_BOARD_FAMILY_ASTERIX and bld.env.VARIANT == 'prf' and not bld.env.CONFIG_MFG:
             fw_max_size = flash_size // 2
         else:
             fw_max_size = flash_size
@@ -363,7 +364,7 @@ def _link_firmware(bld, sources):
             bld(rule=waftools.objcopy.objcopy_bin, source=elf_node, target=bin_node)
 
         # Create the log_strings .elf and check the format specifier rules
-        if 'PBL_LOGS_HASHED' in bld.env.DEFINES:
+        if bld.env.CONFIG_LOG_HASHED:
             fw_loghash_node = bld.path.get_bld().make_node('tintin_fw_loghash_dict.json')
             bld(rule=waftools.generate_log_strings_json.wafrule,
                 source=elf_node, target=fw_loghash_node)
@@ -442,7 +443,7 @@ def _build_recovery(bld):
             'apps/prf/mfg_mic_obelix.c',
         ])
 
-    if not bld.env.CONFIG_BOARD_FAMILY_OBELIX or not bld.env.IS_MFG:
+    if not bld.env.CONFIG_BOARD_FAMILY_OBELIX or not bld.env.CONFIG_MFG:
         excludes.extend([
             'apps/prf/mfg_hrm_ctr_leakage_obelix.c',
         ])
@@ -475,7 +476,7 @@ def _build_recovery(bld):
 
 
 
-    if bld.env.DISABLE_PROMPT:
+    if not bld.env.CONFIG_PROMPT:
         sources = [ x for x in sources if not x.abspath().endswith('console/prompt.c') ]
         sources = [ x for x in sources if not x.abspath().endswith('console/prompt_commands.c') ]
 
@@ -573,7 +574,7 @@ def _build_normal(bld):
     sources.append(bld.path.get_bld().make_node('resource/timeline_resource_table.auto.c'))
     sources.append(bld.path.get_bld().make_node('builtin_resources.auto.c'))
 
-    if bld.env.DISABLE_PROMPT:
+    if not bld.env.CONFIG_PROMPT:
         sources = [ x for x in sources if not x.abspath().endswith('console/prompt.c') ]
         sources = [ x for x in sources if not x.abspath().endswith('console/prompt_commands.c') ]
 
